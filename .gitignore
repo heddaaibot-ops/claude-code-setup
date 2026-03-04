@@ -1,0 +1,34 @@
+# 工作目錄（包含用戶數據）
+claude-proxy-workspace/
+
+# 日誌文件
+*.log
+
+# 歷史文件（包含用戶對話）
+history/
+*.history.json
+
+# 記憶文件（包含用戶數據）
+memory/
+
+# 臨時文件
+*.tmp
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# 備份文件
+*.bak
+*~
+
+# 敏感信息
+*.key
+*.token
+*.secret
+.env
+
+# Node modules（如果有）
+node_modules/

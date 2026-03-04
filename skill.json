@@ -1,0 +1,8 @@
+{
+  "name": "claude-code-setup",
+  "description": "🚀 一鍵配置 Claude Code CLI 反向代理給 OpenClaw agents 使用，利用 Claude Max/Team 訂閱免費運行 Claude Opus 4-6",
+  "version": "1.0.0",
+  "author": "Community",
+  "tags": ["claude", "proxy", "cli", "setup", "opus"],
+  "command": "python3 setup.py"
+}
