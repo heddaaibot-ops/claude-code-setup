@@ -57,7 +57,7 @@ def check_dependencies():
     print_success(f"Claude CLI 已安裝: {claude_path}")
 
     # 檢查是否已登入
-    result = subprocess.run(["claude", "auth", "whoami"], capture_output=True)
+    result = subprocess.run(["claude", "auth", "status"], capture_output=True)
     if result.returncode != 0:
         print_error("Claude CLI 未登入")
         print_info("請先登入 Claude:")
@@ -165,7 +165,7 @@ def create_proxy_server(workspace_path, claude_cli_path):
  */
 
 const http = require('http');
-const {{ spawn }} = require('child_process');
+const {{ exec }} = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -303,46 +303,49 @@ function buildPrompt(chatId, newMessage) {{
 }}
 
 /**
- * 調用 Claude CLI
+ * 調用 Claude CLI (使用 exec 避免 TTY 阻塞)
  */
-function callClaudeCLI(prompt, onData, onEnd, onError) {{
-  const args = [
-    '--print',
-    '--dangerously-skip-permissions',
-    prompt
-  ];
+function callClaudeCLI(prompt, onEnd, onError) {{
+  // 轉義單引號並構建命令
+  const safePrompt = prompt.replace(/'/g, "'\\\\''");
+  const cmd = `${{CLAUDE_CLI}} --print --dangerously-skip-permissions --output-format json '${{safePrompt}}' < /dev/null`;
 
-  console.log('[CLI] Spawning Claude CLI...');
-  const child = spawn(CLAUDE_CLI, args, {{
+  console.log('[CLI] Executing Claude CLI...');
+
+  // 構建完整的 PATH（包含 Homebrew）
+  const fullPath = [
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    '/usr/bin',
+    '/bin',
+    '/usr/sbin',
+    '/sbin',
+    process.env.PATH || ''
+  ].filter(Boolean).join(':');
+
+  exec(cmd, {{
     cwd: WORKSPACE,
-    env: {{ ...process.env }}
-  }});
-
-  let output = '';
-  let errorOutput = '';
-
-  child.stdout.on('data', (data) => {{
-    const chunk = data.toString();
-    output += chunk;
-    onData(chunk);
-  }});
-
-  child.stderr.on('data', (data) => {{
-    errorOutput += data.toString();
-    console.error('[CLI] stderr:', data.toString());
-  }});
-
-  child.on('close', (code) => {{
-    if (code === 0) {{
-      onEnd(output);
-    }} else {{
-      onError(new Error(`CLI exited with code ${{code}}: ${{errorOutput}}`));
+    shell: '/bin/zsh',
+    maxBuffer: 10 * 1024 * 1024, // 10MB
+    env: {{
+      ...process.env,
+      PATH: fullPath
     }}
+  }}, (error, stdout, stderr) => {{
+    if (error) {{
+      console.error('[CLI] Error:', error.message);
+      console.error('[CLI] stderr:', stderr);
+      onError(error);
+      return;
+    }}
+
+    if (stderr) {{
+      console.error('[CLI] stderr:', stderr);
+    }}
+
+    console.log('[CLI] Success, output length:', stdout.length);
+    onEnd(stdout.trim());
   }});
-
-  child.on('error', onError);
-
-  return child;
 }}
 
 /**
@@ -383,35 +386,84 @@ function handleMessagesRequest(req, res) {{
       addToHistory(chatId, 'user', userContent);
 
       if (stream) {{
-        // SSE streaming
+        // SSE streaming with full Anthropic event format
         res.writeHead(200, {{
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
           'Connection': 'keep-alive'
         }});
 
-        let assistantContent = '';
+        // Send message_start event
+        const messageId = `msg-${{Date.now()}}`;
+        res.write(`event: message_start\\n`);
+        res.write(`data: ${{JSON.stringify({{
+          type: 'message_start',
+          message: {{
+            id: messageId,
+            type: 'message',
+            role: 'assistant',
+            content: [],
+            model: 'claude-opus-4',
+            stop_reason: null,
+            usage: {{ input_tokens: 0, output_tokens: 0 }}
+          }}
+        }})}}\\n\\n`);
+
+        // Send content_block_start event
+        res.write(`event: content_block_start\\n`);
+        res.write(`data: ${{JSON.stringify({{
+          type: 'content_block_start',
+          index: 0,
+          content_block: {{ type: 'text', text: '' }}
+        }})}}\\n\\n`);
 
         callClaudeCLI(
           prompt,
-          (chunk) => {{
-            assistantContent += chunk;
-            const event = {{
-              type: 'content_block_delta',
-              delta: {{ type: 'text_delta', text: chunk }}
-            }};
-            res.write(`data: ${{JSON.stringify(event)}}\\n\\n`);
-          }},
           (fullOutput) => {{
-            addToHistory(chatId, 'assistant', assistantContent);
-            const endEvent = {{ type: 'message_stop' }};
-            res.write(`data: ${{JSON.stringify(endEvent)}}\\n\\n`);
+            // Send the full output as content_block_delta
+            // Note: exec returns complete output, not streaming chunks
+            // For true streaming, we'd need a different approach
+            res.write(`event: content_block_delta\\n`);
+            res.write(`data: ${{JSON.stringify({{
+              type: 'content_block_delta',
+              index: 0,
+              delta: {{ type: 'text_delta', text: fullOutput }}
+            }})}}\\n\\n`);
+
+            // Send content_block_stop event
+            res.write(`event: content_block_stop\\n`);
+            res.write(`data: ${{JSON.stringify({{
+              type: 'content_block_stop',
+              index: 0
+            }})}}\\n\\n`);
+
+            // Send message_delta event
+            res.write(`event: message_delta\\n`);
+            res.write(`data: ${{JSON.stringify({{
+              type: 'message_delta',
+              delta: {{ stop_reason: 'end_turn', stop_sequence: null }},
+              usage: {{ output_tokens: 0 }}
+            }})}}\\n\\n`);
+
+            // Send message_stop event
+            res.write(`event: message_stop\\n`);
+            res.write(`data: ${{JSON.stringify({{
+              type: 'message_stop'
+            }})}}\\n\\n`);
+
+            addToHistory(chatId, 'assistant', fullOutput);
             res.end();
           }},
           (error) => {{
             console.error('[Error]', error.message);
-            const errorEvent = {{ type: 'error', error: error.message }};
-            res.write(`data: ${{JSON.stringify(errorEvent)}}\\n\\n`);
+            res.write(`event: error\\n`);
+            res.write(`data: ${{JSON.stringify({{
+              type: 'error',
+              error: {{
+                type: 'api_error',
+                message: error.message
+              }}
+            }})}}\\n\\n`);
             res.end();
           }}
         );
@@ -419,7 +471,6 @@ function handleMessagesRequest(req, res) {{
         // Non-streaming
         callClaudeCLI(
           prompt,
-          () => {{}},
           (output) => {{
             addToHistory(chatId, 'assistant', output);
             const response = {{
@@ -531,53 +582,53 @@ def test_proxy(proxy_file):
         process.kill()
         return None
 
-def configure_agent(agent_name, workspace_path):
-    """配置 OpenClaw Agent"""
-    print_step(5, f"配置 OpenClaw Agent: {agent_name}")
+def configure_openclaw(workspace_path):
+    """配置 OpenClaw 全局模型"""
+    print_step(5, "配置 OpenClaw 全局模型")
 
-    models_json_path = Path.home() / ".openclaw" / "agents" / agent_name / "agent" / "models.json"
+    openclaw_config_path = Path.home() / ".openclaw" / "openclaw.json"
 
-    if not models_json_path.parent.exists():
-        print_error(f"Agent 目錄不存在: {models_json_path.parent}")
+    if not openclaw_config_path.exists():
+        print_error(f"OpenClaw 配置文件不存在: {openclaw_config_path}")
+        print_info("請先運行 OpenClaw 以創建配置文件")
         return False
 
     # 讀取現有配置
-    if models_json_path.exists():
-        with open(models_json_path, "r") as f:
-            config = json.load(f)
-    else:
-        config = {{"providers": {{}}}}
+    with open(openclaw_config_path, "r") as f:
+        config = json.load(f)
+
+    # 確保 models.providers 存在
+    if "models" not in config:
+        config["models"] = {{}}
+    if "providers" not in config["models"]:
+        config["models"]["providers"] = {{}}
 
     # 添加 claude-local provider
-    config["providers"]["claude-local"] = {{
+    config["models"]["providers"]["claude-local"] = {{
         "baseUrl": "http://127.0.0.1:8765",
         "api": "anthropic-messages",
         "apiKey": "sk-ant-dummy-key-for-local-proxy",
         "models": [
             {{
                 "id": "claude-opus-4",
-                "name": "Claude Opus 4 (Local)",
-                "contextWindow": 200000,
-                "maxTokens": 8192,
-                "reasoning": False,
-                "input": ["text", "image"],
-                "cost": {{
-                    "input": 0,
-                    "output": 0,
-                    "cacheRead": 0,
-                    "cacheWrite": 0
-                }},
-                "api": "anthropic-messages"
+                "name": "Claude Opus 4 (Local CLI)"
+            }},
+            {{
+                "id": "claude-sonnet-4",
+                "name": "Claude Sonnet 4 (Local CLI)"
             }}
         ]
     }}
 
     # 寫回配置
-    with open(models_json_path, "w") as f:
+    with open(openclaw_config_path, "w") as f:
         json.dump(config, f, indent=2)
 
-    print_success(f"已更新 {agent_name} 的配置")
-    print_info(f"配置文件: {models_json_path}")
+    print_success("已更新 OpenClaw 全局配置")
+    print_info(f"配置文件: {openclaw_config_path}")
+    print_info("新增模型:")
+    print_info("  • Claude Opus 4 (Local CLI)")
+    print_info("  • Claude Sonnet 4 (Local CLI)")
     return True
 
 def create_launchagent(proxy_file):
@@ -651,15 +702,8 @@ def main():
         print_error("代理服務器啟動失敗")
         sys.exit(1)
 
-    # 配置 agents
-    print(f"\n{Colors.BOLD}請輸入要配置的 agent 名稱（多個用逗號分隔）：{Colors.END}")
-    agent_input = input(f"{Colors.YELLOW}> {Colors.END}").strip()
-
-    agents = [a.strip() for a in agent_input.split(",") if a.strip()]
-
-    if agents:
-        for agent in agents:
-            configure_agent(agent, workspace_path)
+    # 配置 OpenClaw
+    configure_openclaw(workspace_path)
 
     # 創建 LaunchAgent
     create_launchagent(proxy_file)
@@ -673,7 +717,7 @@ def main():
     print(f"  • 工作目錄: {workspace_path}")
     print(f"  • 代理服務器: {proxy_file}")
     print(f"  • 代理端口: 8765")
-    print(f"  • 已配置的 agents: {', '.join(agents) if agents else '無'}")
+    print(f"  • OpenClaw 配置: ~/.openclaw/openclaw.json")
 
     print(f"\n{Colors.BOLD}使用方法：{Colors.END}")
     print(f"  在 OpenClaw 中選擇 'Claude Opus 4 (Local)' 模型即可使用")
